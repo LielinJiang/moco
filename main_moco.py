@@ -9,21 +9,39 @@ import shutil
 import time
 import warnings
 
-import torch
-import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
-import torch.optim
-import torch.multiprocessing as mp
-import torch.utils.data
-import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
+import paddle
+import paddle.nn as nn
+import paddle.distributed as dist
+# import torch.nn.parallel
+# import torch.backends.cudnn as cudnn
+# import torch.distributed as dist
+# import torch.optim
+# import torch.multiprocessing as mp
+# import torch.utils.data
+# import torch.utils.data.distributed
+# import torchvision.transforms as transforms
+# import torchvision.datasets as datasets
+import paddle.vision.models as models
+import paddle.vision.datasets as datasets
+import paddle.vision.transforms as transforms
 
 import moco.loader
 import moco.builder
+import moco.transforms
+
+class ImageFolder(datasets.ImageFolder):
+    def __getitem__(self, index):
+        path = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+
+        if not isinstance(sample, (list, tuple)):
+            return [sample]
+        return sample
+    
+    # def __len__(self):
+    #     return 1000
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -103,8 +121,8 @@ def main():
 
     if args.seed is not None:
         random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        cudnn.deterministic = True
+        paddle.seed(args.seed)
+        # cudnn.deterministic = True
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
                       'which can slow down your training considerably! '
@@ -114,28 +132,33 @@ def main():
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
                       'disable data parallelism.')
+    else:
+        args.gpu = dist.get_rank()
 
     if args.dist_url == "env://" and args.world_size == -1:
         args.world_size = int(os.environ["WORLD_SIZE"])
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
-    ngpus_per_node = torch.cuda.device_count()
+    # ngpus_per_node = torch.cuda.device_count()
+    ngpus_per_node = len(paddle.get_cuda_rng_state())
+    
+
     if args.multiprocessing_distributed:
         # Since we have ngpus_per_node processes per node, the total world_size
         # needs to be adjusted accordingly
         args.world_size = ngpus_per_node * args.world_size
         # Use torch.multiprocessing.spawn to launch distributed processes: the
         # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        print('debugggg', args.gpu, ngpus_per_node, dist.get_world_size(), dist.get_rank())
+        dist.spawn(main_worker, nprocs=ngpus_per_node, args=(args.gpu, ngpus_per_node, args))
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    args.gpu = gpu
-
+    args.gpu = dist.get_rank()
     # suppress printing if not master
     if args.multiprocessing_distributed and args.gpu != 0:
         def print_pass(*args):
@@ -152,8 +175,9 @@ def main_worker(gpu, ngpus_per_node, args):
             # For multiprocessing distributed training, rank needs to be the
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
-        dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-                                world_size=args.world_size, rank=args.rank)
+        dist.init_parallel_env()
+        # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
+        #                         world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
@@ -165,34 +189,38 @@ def main_worker(gpu, ngpus_per_node, args):
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
         # DistributedDataParallel will use all available devices.
-        if args.gpu is not None:
-            torch.cuda.set_device(args.gpu)
-            model.cuda(args.gpu)
-            # When using a single GPU per process and per
-            # DistributedDataParallel, we need to divide the batch size
-            # ourselves based on the total number of GPUs we have
-            args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        else:
-            model.cuda()
-            # DistributedDataParallel will divide and allocate batch_size to all
-            # available GPUs if device_ids are not set
-            model = torch.nn.parallel.DistributedDataParallel(model)
+        # if args.gpu is not None:
+        #     torch.cuda.set_device(args.gpu)
+        #     model.cuda(args.gpu)
+        #     # When using a single GPU per process and per
+        #     # DistributedDataParallel, we need to divide the batch size
+        #     # ourselves based on the total number of GPUs we have
+        #     args.batch_size = int(args.batch_size / ngpus_per_node)
+        #     args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
+        #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # else:
+        #     model.cuda()
+        #     # DistributedDataParallel will divide and allocate batch_size to all
+        #     # available GPUs if device_ids are not set
+        #     model = torch.nn.parallel.DistributedDataParallel(model)
+        args.batch_size = int(args.batch_size / ngpus_per_node)
+        model = paddle.DataParallel(model)
     elif args.gpu is not None:
-        torch.cuda.set_device(args.gpu)
-        model = model.cuda(args.gpu)
+        # torch.cuda.set_device(args.gpu)
+        # model = model.cuda(args.gpu)
         # comment out the following line for debugging
-        raise NotImplementedError("Only DistributedDataParallel is supported.")
+        pass
+        # raise NotImplementedError("Only DistributedDataParallel is supported.")
     else:
         # AllGather implementation (batch shuffle, queue update, etc.) in
         # this code only supports DistributedDataParallel.
         raise NotImplementedError("Only DistributedDataParallel is supported.")
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    optimizer = paddle.optimizer.Momentum(args.lr,
+                                parameters=model.parameters(),
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -201,66 +229,68 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = paddle.load(args.resume)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = paddle.load(args.resume)#, map_location=loc)
             args.start_epoch = checkpoint['epoch']
             model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
+            optimizer.set_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    cudnn.benchmark = True
+    # cudnn.benchmark = True
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    normalize = transforms.Normalize(mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
+                                     std=[0.229 * 255, 0.224 * 255, 0.225 * 255])
     if args.aug_plus:
         # MoCo v2's aug: similar to SimCLR https://arxiv.org/abs/2002.05709
         augmentation = [
             transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomApply([
+            moco.transforms.RandomApply([
                 transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)  # not strengthened
             ], p=0.8),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
+            moco.transforms.RandomGrayscale(p=0.2),
+            moco.transforms.RandomApply([moco.loader.GaussianBlur([.1, 2.])], p=0.5),
             transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
+            transforms.Transpose(),
             normalize
         ]
     else:
         # MoCo v1's aug: the same as InstDisc https://arxiv.org/abs/1805.01978
         augmentation = [
             transforms.RandomResizedCrop(224, scale=(0.2, 1.)),
-            transforms.RandomGrayscale(p=0.2),
+            moco.transforms.RandomGrayscale(p=0.2),
             transforms.ColorJitter(0.4, 0.4, 0.4, 0.4),
             transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
+            transforms.Transpose(),
             normalize
         ]
 
-    train_dataset = datasets.ImageFolder(
+    train_dataset = ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
+        transform=moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
 
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    else:
-        train_sampler = None
+    # if args.distributed:
+    train_sampler = paddle.io.DistributedBatchSampler(train_dataset, args.batch_size, shuffle=True, drop_last=True)
+    # else:
+    #     train_sampler = None
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+    train_loader = paddle.io.DataLoader(
+        train_dataset, batch_sampler=train_sampler, num_workers=args.workers, use_shared_memory=False)
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
+    #     num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
+        # if args.distributed:
+        #     train_sampler.set_epoch(epoch)
+        # adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, args)
@@ -290,13 +320,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, _) in enumerate(train_loader):
+    for i, images in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images[0] = images[0].cuda(args.gpu, non_blocking=True)
-            images[1] = images[1].cuda(args.gpu, non_blocking=True)
+        # if args.gpu is not None:
+        #     images[0] = images[0]#.cuda(args.gpu, non_blocking=True)
+        #     images[1] = images[1]#.cuda(args.gpu, non_blocking=True)
 
         # compute output
         output, target = model(im_q=images[0], im_k=images[1])
@@ -305,12 +335,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), images[0].size(0))
-        top1.update(acc1[0], images[0].size(0))
-        top5.update(acc5[0], images[0].size(0))
+        losses.update(float(loss), images[0].shape[0])
+        top1.update(float(acc1[0]), images[0].shape[0])
+        top5.update(float(acc5[0]), images[0].shape[0])
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
+        optimizer.clear_grad()
         loss.backward()
         optimizer.step()
 
@@ -323,7 +353,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    torch.save(state, filename)
+    paddle.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
 
@@ -361,7 +391,12 @@ class ProgressMeter(object):
     def display(self, batch):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
-        print('\t'.join(entries))
+        msg = '\t'.join(entries)
+        print(msg)
+        if dist.get_rank() == 0:
+            with open('2.log', 'a+') as f:
+                f.write(msg + '\n')
+        # print('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
@@ -383,18 +418,18 @@ def adjust_learning_rate(optimizer, epoch, args):
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
-    with torch.no_grad():
+    with paddle.no_grad():
         maxk = max(topk)
-        batch_size = target.size(0)
+        batch_size = target.shape[0]
 
         _, pred = output.topk(maxk, 1, True, True)
         pred = pred.t()
-        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        correct = paddle.cast(pred == target.reshape([1, -1]).expand_as(pred), 'float32')
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
-            res.append(correct_k.mul_(100.0 / batch_size))
+            correct_k = correct[:k].reshape([-1]).sum(0, keepdim=True)
+            res.append(correct_k * 100.0 / batch_size)
         return res
 
 
