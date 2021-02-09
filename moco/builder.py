@@ -1,9 +1,7 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import pickle
 import paddle
 import paddle.nn as nn
-# import torch
-# import torch.nn as nn
-
+from .init import init_backbone_weight
 
 class MoCo(nn.Layer):
     """
@@ -29,15 +27,15 @@ class MoCo(nn.Layer):
         self.encoder_k = base_encoder(num_classes=dim)
 
         if mlp:  # hack: brute-force replacement
-            dim_mlp = self.encoder_q.fc.weight.shape[1]
+            dim_mlp = self.encoder_q.fc.weight.shape[0]
             self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
             self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
 
+        init_backbone_weight(self.encoder_q)
+
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.set_value(param_q)  # initialize
-            param_k.trainable = False  # not update by gradient
-            # param_k.data.copy_(param_q.data)  # initialize
-            # param_k.requires_grad = False  # not update by gradient
+            param_k.stop_gradient = True  # not update by gradient
 
         # create the queue
         self.register_buffer("queue", paddle.randn([dim, K]))
@@ -51,9 +49,8 @@ class MoCo(nn.Layer):
         Momentum update of the key encoder
         """
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k = param_k * self.m + param_q * (1. - self.m)
-            # param_k.set_value(param_k * self.m + param_q * (1. - self.m))
-            # param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
+            paddle.assign((param_k * self.m + param_q * (1. - self.m)), param_k)
+            param_k.stop_gradient = True
 
     @paddle.no_grad()
     def _dequeue_and_enqueue(self, keys):
@@ -89,7 +86,6 @@ class MoCo(nn.Layer):
 
         # broadcast to all gpus
         if paddle.distributed.get_world_size() > 1:
-            # print('forward worlder size', paddle.distributed.get_world_size())
             paddle.distributed.broadcast(idx_shuffle, src=0)
 
         # index for restoring
@@ -100,7 +96,6 @@ class MoCo(nn.Layer):
         idx_this = idx_shuffle.reshape([num_gpus, -1])[gpu_idx]
         # return paddle.gather(x_gather, idx_this), idx_unshuffle
         return paddle.index_select(x_gather, idx_this), idx_unshuffle
-        # return x_gather[idx_this], idx_unshuffle
 
     @paddle.no_grad()
     def _batch_unshuffle_ddp(self, x, idx_unshuffle):
@@ -120,7 +115,6 @@ class MoCo(nn.Layer):
         idx_this = idx_unshuffle.reshape([num_gpus, -1])[gpu_idx]
 
         return paddle.index_select(x_gather, idx_this)
-        # return x_gather[idx_this]
 
     def forward(self, im_q, im_k):
         """
@@ -151,12 +145,9 @@ class MoCo(nn.Layer):
         # compute logits
         # Einstein sum is more intuitive
         # positive logits: Nx1
-        # l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
         l_pos = paddle.sum(q * k, axis=1).unsqueeze(-1)
-        # l_pos = torch.einsum('nc,nc->n', [q, k]).unsqueeze(-1)
         # negative logits: NxK
         l_neg = paddle.matmul(q, self.queue.clone().detach())
-        # l_neg = torch.einsum('nc,ck->nk', [q, self.queue.clone().detach()])
 
         # logits: Nx(1+K)
         logits = paddle.concat([l_pos, l_neg], axis=1)
@@ -183,23 +174,8 @@ def concat_all_gather(tensor):
     if paddle.distributed.get_world_size() < 2:
         return tensor
 
-    tensors_gather = [paddle.ones_like(tensor)
-        for _ in range(paddle.distributed.get_world_size())]
+    tensors_gather = []
     paddle.distributed.all_gather(tensors_gather, tensor)
 
     output = paddle.concat(tensors_gather, axis=0)
     return output
-
-
-# Epoch: [0][ 4390/40036] Time  0.220 ( 0.288)    Data  0.000 ( 0.065)    Loss 1.0946e+01 (1.0424e+01)    Acc@1   0.00 (  0.05)  Acc@5   0.00 (  0.12)
-# Epoch: [0][ 4400/40036] Time  0.200 ( 0.288)    Data  0.000 ( 0.065)    Loss 1.0931e+01 (1.0425e+01)    Acc@1   0.00 (  0.05)  Acc@5   0.00 (  0.12)
-# Epoch: [0][ 4410/40036] Time  0.182 ( 0.288)    Data  0.000 ( 0.065)    Loss 1.0749e+01 (1.0426e+01)    Acc@1   0.00 (  0.05)  Acc@5   0.00 (  0.11)
-
-# Epoch: [0][ 4390/40036] Time  0.201 ( 0.321)    Data  0.000 ( 0.097)    Loss 1.0965e+01 (1.0470e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)
-# Epoch: [0][ 4400/40036] Time  0.216 ( 0.321)    Data  0.000 ( 0.096)    Loss 1.0918e+01 (1.0471e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)
-# Epoch: [0][ 4410/40036] Time  3.413 ( 0.322)    Data  2.983 ( 0.097)    Loss 1.0877e+01 (1.0472e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)
-
-
-# Epoch: [0][ 4390/40036] Time  0.185 ( 0.298)    Data  0.000 ( 0.050)    Loss 1.0874e+01 (1.0458e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)
-# Epoch: [0][ 4400/40036] Time  0.243 ( 0.298)    Data  0.000 ( 0.050)    Loss 1.0836e+01 (1.0459e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)
-# Epoch: [0][ 4410/40036] Time  0.257 ( 0.298)    Data  0.000 ( 0.050)    Loss 1.0851e+01 (1.0460e+01)    Acc@1   0.00 (  0.04)  Acc@5   0.00 (  0.11)

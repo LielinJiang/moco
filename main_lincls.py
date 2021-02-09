@@ -8,18 +8,21 @@ import shutil
 import time
 import warnings
 
-import torch
-import torch.nn as nn
-import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
-import torch.optim
-import torch.multiprocessing as mp
-import torch.utils.data
-import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
-import torchvision.models as models
+import paddle
+import paddle.nn as nn
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.parallel
+# import torch.backends.cudnn as cudnn
+# import torch.distributed as dist
+# import torch.optim
+# import torch.multiprocessing as mp
+# import torch.utils.data
+# import torch.utils.data.distributed
+# import torchvision.transforms as transforms
+# import torchvision.datasets as datasets
+# import torchvision.models as models
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -87,14 +90,15 @@ def main():
     args = parser.parse_args()
 
     if args.seed is not None:
-        random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        cudnn.deterministic = True
-        warnings.warn('You have chosen to seed training. '
-                      'This will turn on the CUDNN deterministic setting, '
-                      'which can slow down your training considerably! '
-                      'You may see unexpected behavior when restarting '
-                      'from checkpoints.')
+        pass
+        # random.seed(args.seed)
+        # torch.manual_seed(args.seed)
+        # cudnn.deterministic = True
+        # warnings.warn('You have chosen to seed training. '
+        #               'This will turn on the CUDNN deterministic setting, '
+        #               'which can slow down your training considerably! '
+        #               'You may see unexpected behavior when restarting '
+        #               'from checkpoints.')
 
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
