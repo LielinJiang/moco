@@ -1,9 +1,10 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import pickle
 import paddle
 import paddle.nn as nn
 # import torch
 # import torch.nn as nn
-
+from .init import init_backbone_weight
 
 class MoCo(nn.Layer):
     """
@@ -29,13 +30,15 @@ class MoCo(nn.Layer):
         self.encoder_k = base_encoder(num_classes=dim)
 
         if mlp:  # hack: brute-force replacement
-            dim_mlp = self.encoder_q.fc.weight.shape[1]
+            dim_mlp = self.encoder_q.fc.weight.shape[0]
             self.encoder_q.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_q.fc)
             self.encoder_k.fc = nn.Sequential(nn.Linear(dim_mlp, dim_mlp), nn.ReLU(), self.encoder_k.fc)
 
+        init_backbone_weight(self.encoder_q)
+
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
             param_k.set_value(param_q)  # initialize
-            param_k.trainable = False  # not update by gradient
+            param_k.stop_gradient = True  # not update by gradient
             # param_k.data.copy_(param_q.data)  # initialize
             # param_k.requires_grad = False  # not update by gradient
 
@@ -51,8 +54,10 @@ class MoCo(nn.Layer):
         Momentum update of the key encoder
         """
         for param_q, param_k in zip(self.encoder_q.parameters(), self.encoder_k.parameters()):
-            param_k = param_k * self.m + param_q * (1. - self.m)
+            # param_k = param_k * self.m + param_q * (1. - self.m)
+            paddle.assign((param_k * self.m + param_q * (1. - self.m)), param_k)
             # param_k.set_value(param_k * self.m + param_q * (1. - self.m))
+            param_k.stop_gradient = True
             # param_k.data = param_k.data * self.m + param_q.data * (1. - self.m)
 
     @paddle.no_grad()
@@ -86,6 +91,8 @@ class MoCo(nn.Layer):
 
         # random shuffle index
         idx_shuffle = paddle.randperm(batch_size_all).cuda()
+        # idx_shuffle = pickle.load(open('/workspace/codes-vs/moco_paddle/idx_shuffle.pkl', 'rb'))
+        # idx_shuffle = paddle.to_tensor(idx_shuffle)
 
         # broadcast to all gpus
         if paddle.distributed.get_world_size() > 1:
@@ -183,8 +190,9 @@ def concat_all_gather(tensor):
     if paddle.distributed.get_world_size() < 2:
         return tensor
 
-    tensors_gather = [paddle.ones_like(tensor)
-        for _ in range(paddle.distributed.get_world_size())]
+    # tensors_gather = [paddle.ones_like(tensor)
+    #     for _ in range(paddle.distributed.get_world_size())]
+    tensors_gather = []
     paddle.distributed.all_gather(tensors_gather, tensor)
 
     output = paddle.concat(tensors_gather, axis=0)

@@ -7,20 +7,12 @@ import os
 import random
 import shutil
 import time
+import pickle
 import warnings
 
 import paddle
 import paddle.nn as nn
 import paddle.distributed as dist
-# import torch.nn.parallel
-# import torch.backends.cudnn as cudnn
-# import torch.distributed as dist
-# import torch.optim
-# import torch.multiprocessing as mp
-# import torch.utils.data
-# import torch.utils.data.distributed
-# import torchvision.transforms as transforms
-# import torchvision.datasets as datasets
 import paddle.vision.models as models
 import paddle.vision.datasets as datasets
 import paddle.vision.transforms as transforms
@@ -28,6 +20,7 @@ import paddle.vision.transforms as transforms
 import moco.loader
 import moco.builder
 import moco.transforms
+
 
 class ImageFolder(datasets.ImageFolder):
     def __getitem__(self, index):
@@ -116,6 +109,36 @@ parser.add_argument('--cos', action='store_true',
                     help='use cosine lr schedule')
 
 
+def save(state_dicts, file_name):
+    def convert(state_dict):
+        model_dict = {}
+
+        for k, v in state_dict.items():
+            if isinstance(
+                    v,
+                (paddle.fluid.framework.Variable, paddle.fluid.core.VarBase)):
+                model_dict[k] = v.numpy()
+            else:
+                model_dict[k] = v
+
+        return model_dict
+
+    final_dict = {}
+    for k, v in state_dicts.items():
+        if isinstance(
+                v,
+            (paddle.fluid.framework.Variable, paddle.fluid.core.VarBase)):
+            final_dict = convert(state_dicts)
+            break
+        elif isinstance(v, dict):
+            final_dict[k] = convert(v)
+        else:
+            final_dict[k] = v
+
+    with open(file_name, 'wb') as f:
+        pickle.dump(final_dict, f)
+        
+
 def main():
     args = parser.parse_args()
 
@@ -140,7 +163,6 @@ def main():
 
     args.distributed = args.world_size > 1 or args.multiprocessing_distributed
 
-    # ngpus_per_node = torch.cuda.device_count()
     ngpus_per_node = len(paddle.get_cuda_rng_state())
     
 
@@ -184,6 +206,12 @@ def main_worker(gpu, ngpus_per_node, args):
         models.__dict__[args.arch],
         args.moco_dim, args.moco_k, args.moco_m, args.moco_t, args.mlp)
     print(model)
+    # init.init_backbone_weight(model)
+    # state_dict = paddle.load('converted_init_weight.pdparams')
+    # model.set_state_dict(state_dict)
+
+    # paddle.save(model.state_dict(), './moco_paddle_init.pdparams')
+    # print('save init model success!!')
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -204,6 +232,22 @@ def main_worker(gpu, ngpus_per_node, args):
         #     # available GPUs if device_ids are not set
         #     model = torch.nn.parallel.DistributedDataParallel(model)
         args.batch_size = int(args.batch_size / ngpus_per_node)
+        if dist.get_world_size() > 1:
+            syc_paramters_name = int(time.time())
+            if dist.get_rank() == 0:
+                target_name = str(syc_paramters_name) + '_temp.pdparams'
+                paddle.save(model.state_dict(), target_name)
+            print('forward worlder size', paddle.distributed.get_world_size())
+            syc_paramters_name_tensor = paddle.to_tensor(syc_paramters_name)
+            dist.broadcast(syc_paramters_name_tensor, src=0)
+
+            target_name = str(syc_paramters_name_tensor.numpy()[0]) + '_temp.pdparams'
+            state_dict = paddle.load(target_name)
+            model.set_state_dict(state_dict)
+            dist.barrier()
+            print('sync paramter success, rank', dist.get_rank())
+            if dist.get_rank() == 0:
+                os.remove(target_name)
         model = paddle.DataParallel(model)
     elif args.gpu is not None:
         # torch.cuda.set_device(args.gpu)
@@ -218,29 +262,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss()
-
-    optimizer = paddle.optimizer.Momentum(args.lr,
-                                parameters=model.parameters(),
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = paddle.load(args.resume)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = 'cuda:{}'.format(args.gpu)
-                checkpoint = paddle.load(args.resume)#, map_location=loc)
-            args.start_epoch = checkpoint['epoch']
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.set_state_dict(checkpoint['optimizer'])
-            print("=> loaded checkpoint '{}' (epoch {})"
-                  .format(args.resume, checkpoint['epoch']))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
 
     # cudnn.benchmark = True
 
@@ -282,10 +303,45 @@ def main_worker(gpu, ngpus_per_node, args):
     #     train_sampler = None
 
     train_loader = paddle.io.DataLoader(
-        train_dataset, batch_sampler=train_sampler, num_workers=args.workers, use_shared_memory=False)
+        train_dataset, batch_sampler=train_sampler, num_workers=args.workers)#, use_shared_memory=False)
     # train_loader = torch.utils.data.DataLoader(
     #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
     #     num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
+
+    if args.cos:
+        lr_sched = paddle.optimizer.lr.CosineAnnealingDecay(args.lr, args.epochs * len(train_loader))
+    else:
+        milestone = [x * len(train_loader) for x in args.schedule]
+        lr_sched = paddle.optimizer.lr.MultiStepDecay(args.lr, milestone)
+    optimizer = paddle.optimizer.Momentum(lr_sched,
+                                parameters=model.parameters(),
+                                momentum=args.momentum,
+                                weight_decay=args.weight_decay)
+    save_checkpoint({
+                'epoch': 1234,
+                'arch': args.arch,
+                'state_dict': model.state_dict(),
+                'optimizer' : optimizer.state_dict(),
+            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(1234))
+
+    return
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = paddle.load(args.resume)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = 'cuda:{}'.format(args.gpu)
+                checkpoint = paddle.load(args.resume)#, map_location=loc)
+            args.start_epoch = checkpoint['epoch']
+            model.set_state_dict(checkpoint['state_dict'])
+            optimizer.set_state_dict(checkpoint['optimizer'])
+            print("=> loaded checkpoint '{}' (epoch {})"
+                  .format(args.resume, checkpoint['epoch']))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
 
     for epoch in range(args.start_epoch, args.epochs):
         # if args.distributed:
@@ -293,7 +349,7 @@ def main_worker(gpu, ngpus_per_node, args):
         # adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, lr_sched, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
@@ -305,7 +361,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(epoch))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, criterion, optimizer, lr_sched, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -327,11 +383,19 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         # if args.gpu is not None:
         #     images[0] = images[0]#.cuda(args.gpu, non_blocking=True)
         #     images[1] = images[1]#.cuda(args.gpu, non_blocking=True)
+        # images = pickle.load(open('./images.pkl', 'rb'))
+        # images[0] = paddle.to_tensor(images[0])
+        # images[1] = paddle.to_tensor(images[1])
 
         # compute output
         output, target = model(im_q=images[0], im_k=images[1])
         loss = criterion(output, target)
 
+        # compute gradient and do SGD step
+        optimizer.clear_grad()
+        loss.backward()
+        optimizer.step()
+        lr_sched.step()
         # acc1/acc5 are (K+1)-way contrast classifier accuracy
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -339,21 +403,20 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         top1.update(float(acc1[0]), images[0].shape[0])
         top5.update(float(acc5[0]), images[0].shape[0])
 
-        # compute gradient and do SGD step
-        optimizer.clear_grad()
-        loss.backward()
-        optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
 
+        # filename = '{}_state.pth'.format(i)
+        # paddle.save(model.state_dict(), filename)
+        
         if i % args.print_freq == 0:
-            progress.display(i)
+            progress.display(i, lr_sched)
 
 
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
-    paddle.save(state, filename)
+    save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
 
@@ -388,13 +451,16 @@ class ProgressMeter(object):
         self.meters = meters
         self.prefix = prefix
 
-    def display(self, batch):
+    def display(self, batch, lr_sched=None):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         msg = '\t'.join(entries)
+        if lr_sched is not None:
+            lr = lr_sched.get_lr()
+        msg += ('\tlr: {:.5f}'.format(lr))
         print(msg)
         if dist.get_rank() == 0:
-            with open('2.log', 'a+') as f:
+            with open('7.log', 'a+') as f:
                 f.write(msg + '\n')
         # print('\t'.join(entries))
 
