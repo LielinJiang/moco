@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 import argparse
 import builtins
 import math
@@ -32,9 +30,6 @@ class ImageFolder(datasets.ImageFolder):
         if not isinstance(sample, (list, tuple)):
             return [sample]
         return sample
-    
-    # def __len__(self):
-    #     return 1000
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -145,7 +140,6 @@ def main():
     if args.seed is not None:
         random.seed(args.seed)
         paddle.seed(args.seed)
-        # cudnn.deterministic = True
         warnings.warn('You have chosen to seed training. '
                       'This will turn on the CUDNN deterministic setting, '
                       'which can slow down your training considerably! '
@@ -198,8 +192,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # global rank among all the processes
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_parallel_env()
-        # dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
-        #                         world_size=args.world_size, rank=args.rank)
+
     # create model
     print("=> creating model '{}'".format(args.arch))
     model = moco.builder.MoCo(
@@ -214,23 +207,6 @@ def main_worker(gpu, ngpus_per_node, args):
     # print('save init model success!!')
 
     if args.distributed:
-        # For multiprocessing distributed, DistributedDataParallel constructor
-        # should always set the single device scope, otherwise,
-        # DistributedDataParallel will use all available devices.
-        # if args.gpu is not None:
-        #     torch.cuda.set_device(args.gpu)
-        #     model.cuda(args.gpu)
-        #     # When using a single GPU per process and per
-        #     # DistributedDataParallel, we need to divide the batch size
-        #     # ourselves based on the total number of GPUs we have
-        #     args.batch_size = int(args.batch_size / ngpus_per_node)
-        #     args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
-        #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        # else:
-        #     model.cuda()
-        #     # DistributedDataParallel will divide and allocate batch_size to all
-        #     # available GPUs if device_ids are not set
-        #     model = torch.nn.parallel.DistributedDataParallel(model)
         args.batch_size = int(args.batch_size / ngpus_per_node)
         if dist.get_world_size() > 1:
             syc_paramters_name = int(time.time())
@@ -250,8 +226,6 @@ def main_worker(gpu, ngpus_per_node, args):
                 os.remove(target_name)
         model = paddle.DataParallel(model)
     elif args.gpu is not None:
-        # torch.cuda.set_device(args.gpu)
-        # model = model.cuda(args.gpu)
         # comment out the following line for debugging
         pass
         # raise NotImplementedError("Only DistributedDataParallel is supported.")
@@ -297,16 +271,10 @@ def main_worker(gpu, ngpus_per_node, args):
         traindir,
         transform=moco.loader.TwoCropsTransform(transforms.Compose(augmentation)))
 
-    # if args.distributed:
     train_sampler = paddle.io.DistributedBatchSampler(train_dataset, args.batch_size, shuffle=True, drop_last=True)
-    # else:
-    #     train_sampler = None
 
     train_loader = paddle.io.DataLoader(
         train_dataset, batch_sampler=train_sampler, num_workers=args.workers)#, use_shared_memory=False)
-    # train_loader = torch.utils.data.DataLoader(
-    #     train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-    #     num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
 
     if args.cos:
         lr_sched = paddle.optimizer.lr.CosineAnnealingDecay(args.lr, args.epochs * len(train_loader))
@@ -317,14 +285,13 @@ def main_worker(gpu, ngpus_per_node, args):
                                 parameters=model.parameters(),
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    save_checkpoint({
-                'epoch': 1234,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(1234))
+    # save_checkpoint({
+    #             'epoch': 1234,
+    #             'arch': args.arch,
+    #             'state_dict': model.state_dict(),
+    #             'optimizer' : optimizer.state_dict(),
+    #         }, is_best=False, filename='checkpoint_{:04d}.pth.tar'.format(1234))
 
-    return
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -344,9 +311,6 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     for epoch in range(args.start_epoch, args.epochs):
-        # if args.distributed:
-        #     train_sampler.set_epoch(epoch)
-        # adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
         train(train_loader, model, criterion, optimizer, lr_sched, epoch, args)
@@ -379,13 +343,6 @@ def train(train_loader, model, criterion, optimizer, lr_sched, epoch, args):
     for i, images in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
-
-        # if args.gpu is not None:
-        #     images[0] = images[0]#.cuda(args.gpu, non_blocking=True)
-        #     images[1] = images[1]#.cuda(args.gpu, non_blocking=True)
-        # images = pickle.load(open('./images.pkl', 'rb'))
-        # images[0] = paddle.to_tensor(images[0])
-        # images[1] = paddle.to_tensor(images[1])
 
         # compute output
         output, target = model(im_q=images[0], im_k=images[1])
@@ -459,9 +416,9 @@ class ProgressMeter(object):
             lr = lr_sched.get_lr()
         msg += ('\tlr: {:.5f}'.format(lr))
         print(msg)
-        if dist.get_rank() == 0:
-            with open('7.log', 'a+') as f:
-                f.write(msg + '\n')
+        # if dist.get_rank() == 0:
+        #     with open('7.log', 'a+') as f:
+        #         f.write(msg + '\n')
         # print('\t'.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
